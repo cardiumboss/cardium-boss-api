@@ -1,6 +1,6 @@
 require("dotenv").config();
 const express = require("express");
-const mysql = require("mysql2/promise");
+const { Pool } = require("pg");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const cors = require("cors");
@@ -11,14 +11,23 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  waitForConnections: true,
-  connectionLimit: 10,
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
 });
+
+// Create table on startup
+pool.query(`
+  CREATE TABLE IF NOT EXISTS users (
+    id                 SERIAL PRIMARY KEY,
+    email              VARCHAR(255) UNIQUE NOT NULL,
+    password_hash      VARCHAR(255) NOT NULL,
+    verified           BOOLEAN NOT NULL DEFAULT FALSE,
+    verification_token VARCHAR(255),
+    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )
+`).then(() => console.log("DB ready"))
+  .catch(e => console.error("DB init error:", e.message));
 
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
@@ -67,8 +76,8 @@ app.post("/api/register", async (req, res) => {
   }
 
   try {
-    const [existing] = await pool.query("SELECT id FROM users WHERE email = ?", [email]);
-    if (existing.length > 0) {
+    const existing = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+    if (existing.rows.length > 0) {
       return res.status(409).json({ error: "An account with that email already exists." });
     }
 
@@ -76,7 +85,7 @@ app.post("/api/register", async (req, res) => {
     const token = crypto.randomBytes(32).toString("hex");
 
     await pool.query(
-      "INSERT INTO users (email, password_hash, verified, verification_token) VALUES (?, ?, 0, ?)",
+      "INSERT INTO users (email, password_hash, verified, verification_token) VALUES ($1, $2, FALSE, $3)",
       [email, hash, token]
     );
 
@@ -98,12 +107,12 @@ app.post("/api/login", async (req, res) => {
   }
 
   try {
-    const [rows] = await pool.query("SELECT * FROM users WHERE email = ?", [email]);
-    if (rows.length === 0) {
+    const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    if (result.rows.length === 0) {
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
-    const user = rows[0];
+    const user = result.rows[0];
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) {
       return res.status(401).json({ error: "Invalid email or password." });
@@ -134,17 +143,17 @@ app.get("/api/verify-email", async (req, res) => {
   }
 
   try {
-    const [rows] = await pool.query(
-      "SELECT id FROM users WHERE verification_token = ? AND verified = 0",
+    const result = await pool.query(
+      "SELECT id FROM users WHERE verification_token = $1 AND verified = FALSE",
       [token]
     );
-    if (rows.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(400).send(verifyPage("Already Verified or Invalid", "This link has already been used or is invalid. You can sign in now.", false));
     }
 
     await pool.query(
-      "UPDATE users SET verified = 1, verification_token = NULL WHERE id = ?",
-      [rows[0].id]
+      "UPDATE users SET verified = TRUE, verification_token = NULL WHERE id = $1",
+      [result.rows[0].id]
     );
 
     res.send(verifyPage("Email Verified!", "Your account is now active. You can close this tab and sign in.", true));
