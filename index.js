@@ -16,34 +16,42 @@ const pool = new Pool({
   ssl: false,
 });
 
-// Create table on startup
+// Create/migrate table on startup
 pool.query(`
   CREATE TABLE IF NOT EXISTS users (
-    id                 SERIAL PRIMARY KEY,
-    email              VARCHAR(255) UNIQUE NOT NULL,
-    password_hash      VARCHAR(255) NOT NULL,
-    verified           BOOLEAN NOT NULL DEFAULT FALSE,
-    verification_token VARCHAR(255),
-    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    id                   SERIAL PRIMARY KEY,
+    email                VARCHAR(255) UNIQUE NOT NULL,
+    password_hash        VARCHAR(255) NOT NULL,
+    verified             BOOLEAN NOT NULL DEFAULT FALSE,
+    verification_token   VARCHAR(255),
+    reset_token          VARCHAR(255),
+    reset_token_expires  TIMESTAMP,
+    created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )
-`).then(() => console.log("DB ready"))
-  .catch(e => console.error("DB init error:", e.message));
+`).then(async () => {
+  // Add new columns if they don't exist (migration for existing tables)
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token VARCHAR(255)`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMP`);
+  console.log("DB ready");
+}).catch(e => console.error("DB init error:", e.message));
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT) || 587,
-  secure: process.env.SMTP_SECURE === "true",
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
+function makeTransporter() {
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT) || 587,
+    secure: process.env.SMTP_SECURE === "true",
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+}
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 async function sendVerificationEmail(email, token) {
   const link = `${process.env.APP_URL}/api/verify-email?token=${token}`;
-  await transporter.sendMail({
+  await makeTransporter().sendMail({
     from: `"Cardium Boss" <${process.env.SMTP_USER}>`,
     to: email,
     subject: "Verify your Cardium Boss account",
@@ -64,6 +72,39 @@ async function sendVerificationEmail(email, token) {
   });
 }
 
+async function sendPasswordResetEmail(email, token) {
+  const link = `${process.env.APP_URL}/api/reset-password-page?token=${token}`;
+  await makeTransporter().sendMail({
+    from: `"Cardium Boss" <${process.env.SMTP_USER}>`,
+    to: email,
+    subject: "Reset your Cardium Boss password",
+    html: `
+      <div style="font-family:'Open Sans',Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f0f8ff;border-radius:8px;">
+        <h2 style="color:#1a4a90;margin-bottom:8px;">Password Reset</h2>
+        <p style="color:#2a5a80;font-size:15px;line-height:1.6;">
+          You requested a password reset for your Cardium Boss account. Click below to set a new password.
+        </p>
+        <a href="${link}" style="display:inline-block;margin:24px 0;padding:14px 32px;background:linear-gradient(135deg,#1a5a9a,#2a90e8);color:#fff;text-decoration:none;border-radius:6px;font-size:15px;font-weight:600;">
+          Reset Password
+        </a>
+        <p style="color:#6a8aa8;font-size:12px;">
+          This link expires in 1 hour. If you didn't request a reset, you can safely ignore this email.
+        </p>
+      </div>
+    `,
+  });
+}
+
+// GET /api/smtp-test  (debug — remove after confirming)
+app.get("/api/smtp-test", async (req, res) => {
+  try {
+    await makeTransporter().verify();
+    res.json({ ok: true, host: process.env.SMTP_HOST, user: process.env.SMTP_USER });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message, host: process.env.SMTP_HOST, user: process.env.SMTP_USER });
+  }
+});
+
 // POST /api/resend-verification
 app.post("/api/resend-verification", async (req, res) => {
   const { email } = req.body;
@@ -82,8 +123,8 @@ app.post("/api/resend-verification", async (req, res) => {
 
     res.json({ message: "Verification email resent. Check your inbox." });
   } catch (err) {
-    console.error("Resend error:", err);
-    res.status(500).json({ error: "Server error. Please try again." });
+    console.error("Resend error:", err.message);
+    res.status(500).json({ error: "Server error: " + err.message });
   }
 });
 
@@ -113,11 +154,10 @@ app.post("/api/register", async (req, res) => {
     );
 
     await sendVerificationEmail(email, token);
-
     res.status(201).json({ message: "Account created. Check your email to verify your address." });
   } catch (err) {
-    console.error("Register error:", err);
-    res.status(500).json({ error: "Server error. Please try again." });
+    console.error("Register error:", err.message);
+    res.status(500).json({ error: "Server error: " + err.message });
   }
 });
 
@@ -153,17 +193,96 @@ app.post("/api/login", async (req, res) => {
 
     res.json({ token, email: user.email });
   } catch (err) {
-    console.error("Login error:", err);
+    console.error("Login error:", err.message);
     res.status(500).json({ error: "Server error. Please try again." });
   }
 });
 
-// GET /api/verify-email?token=xxx  (clicked from email)
+// POST /api/forgot-password
+app.post("/api/forgot-password", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email is required." });
+
+  try {
+    const result = await pool.query("SELECT id FROM users WHERE email = $1", [email]);
+    // Always return success to prevent email enumeration
+    if (result.rows.length === 0) {
+      return res.json({ message: "If an account exists for that email, a reset link has been sent." });
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await pool.query(
+      "UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE email = $3",
+      [token, expires, email]
+    );
+
+    await sendPasswordResetEmail(email, token);
+    res.json({ message: "If an account exists for that email, a reset link has been sent." });
+  } catch (err) {
+    console.error("Forgot-password error:", err.message);
+    res.status(500).json({ error: "Server error: " + err.message });
+  }
+});
+
+// GET /api/reset-password-page?token=xxx  (served as HTML form)
+app.get("/api/reset-password-page", async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.send(resetPage("Invalid Link", null, "No reset token provided."));
+
+  try {
+    const result = await pool.query(
+      "SELECT id FROM users WHERE reset_token = $1 AND reset_token_expires > NOW()",
+      [token]
+    );
+    if (result.rows.length === 0) {
+      return res.send(resetPage("Link Expired", null, "This reset link is invalid or has expired. Please request a new one."));
+    }
+    res.send(resetPage("Reset Password", token, null));
+  } catch (err) {
+    console.error("Reset-page error:", err.message);
+    res.send(resetPage("Error", null, "Something went wrong. Please try again."));
+  }
+});
+
+// POST /api/reset-password  (form submission)
+app.post("/api/reset-password", express.urlencoded({ extended: true }), async (req, res) => {
+  const { token, password, confirm } = req.body;
+
+  if (!token || !password || password.length < 6) {
+    return res.send(resetPage("Reset Password", token, "Password must be at least 6 characters."));
+  }
+  if (password !== confirm) {
+    return res.send(resetPage("Reset Password", token, "Passwords do not match."));
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT id FROM users WHERE reset_token = $1 AND reset_token_expires > NOW()",
+      [token]
+    );
+    if (result.rows.length === 0) {
+      return res.send(resetPage("Link Expired", null, "This reset link is invalid or has expired. Please request a new one."));
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+    await pool.query(
+      "UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2",
+      [hash, result.rows[0].id]
+    );
+
+    res.send(verifyPage("Password Reset!", "Your password has been updated. You can now sign in with your new password.", true));
+  } catch (err) {
+    console.error("Reset-password error:", err.message);
+    res.send(resetPage("Reset Password", token, "Server error. Please try again."));
+  }
+});
+
+// GET /api/verify-email?token=xxx
 app.get("/api/verify-email", async (req, res) => {
   const { token } = req.query;
-  if (!token) {
-    return res.status(400).send(verifyPage("Invalid Link", "No verification token was provided.", false));
-  }
+  if (!token) return res.status(400).send(verifyPage("Invalid Link", "No verification token was provided.", false));
 
   try {
     const result = await pool.query(
@@ -181,7 +300,7 @@ app.get("/api/verify-email", async (req, res) => {
 
     res.send(verifyPage("Email Verified!", "Your account is now active. You can close this tab and sign in.", true));
   } catch (err) {
-    console.error("Verify-email error:", err);
+    console.error("Verify-email error:", err.message);
     res.status(500).send(verifyPage("Error", "Something went wrong. Please try again.", false));
   }
 });
@@ -204,7 +323,37 @@ function verifyPage(title, message, success) {
 </body></html>`;
 }
 
-// GET /api/verify  (JWT token check — called by frontend on load)
+function resetPage(title, token, errorMsg) {
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>${title} — Cardium Boss</title>
+<link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  body{margin:0;font-family:'Open Sans',sans-serif;background:radial-gradient(ellipse at 40% 20%,#c8e8f8 0%,#a0d0ec 60%,#80b8e0 100%);min-height:100vh;display:flex;align-items:center;justify-content:center;}
+  .card{background:#fff;border-radius:10px;padding:40px 48px;max-width:400px;width:100%;box-shadow:0 8px 32px rgba(30,80,160,0.12);}
+  h2{color:#1a4a90;margin:0 0 20px;text-align:center;}
+  input{width:100%;box-sizing:border-box;padding:11px 14px;font-size:15px;border:1.5px solid #b0cce4;border-radius:6px;font-family:'Open Sans',sans-serif;margin-bottom:12px;}
+  button{width:100%;padding:14px;background:linear-gradient(135deg,#1a5a9a,#2a90e8);color:#fff;border:none;border-radius:6px;font-size:15px;font-family:'Open Sans',sans-serif;cursor:pointer;text-transform:uppercase;letter-spacing:0.1em;}
+  .error{color:#b91c1c;background:#fef2f2;border:1px solid #fca5a5;border-radius:6px;padding:10px 14px;font-size:14px;margin-bottom:12px;}
+  .brand{text-align:center;color:#1a4a90;font-weight:700;font-size:16px;margin-top:20px;}
+</style>
+</head><body>
+<div class="card">
+  <h2>${title}</h2>
+  ${errorMsg && !token ? `<div class="error">${errorMsg}</div>` : ""}
+  ${token ? `
+  ${errorMsg ? `<div class="error">${errorMsg}</div>` : ""}
+  <form method="POST" action="/api/reset-password">
+    <input type="hidden" name="token" value="${token}">
+    <input type="password" name="password" placeholder="New password (min 6 characters)" required>
+    <input type="password" name="confirm" placeholder="Confirm new password" required>
+    <button type="submit">Set New Password</button>
+  </form>` : ""}
+  <div class="brand">Cardium Boss</div>
+</div>
+</body></html>`;
+}
+
+// GET /api/verify  (JWT token check)
 app.get("/api/verify", (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
