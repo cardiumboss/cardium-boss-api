@@ -64,6 +64,29 @@ async function sendVerificationEmail(email, token) {
   });
 }
 
+// POST /api/resend-verification
+app.post("/api/resend-verification", async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email is required." });
+
+  try {
+    const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    if (result.rows.length === 0) return res.status(404).json({ error: "No account found with that email." });
+
+    const user = result.rows[0];
+    if (user.verified) return res.status(400).json({ error: "This account is already verified. Please sign in." });
+
+    const token = crypto.randomBytes(32).toString("hex");
+    await pool.query("UPDATE users SET verification_token = $1 WHERE id = $2", [token, user.id]);
+    await sendVerificationEmail(email, token);
+
+    res.json({ message: "Verification email resent. Check your inbox." });
+  } catch (err) {
+    console.error("Resend error:", err);
+    res.status(500).json({ error: "Server error. Please try again." });
+  }
+});
+
 // POST /api/register
 app.post("/api/register", async (req, res) => {
   const { email, password } = req.body;
