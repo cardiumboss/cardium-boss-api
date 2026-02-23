@@ -35,17 +35,36 @@ pool.query(`
   console.log("DB ready");
 }).catch(e => console.error("DB init error:", e.message));
 
-function makeTransporter() {
-  const port = Number(process.env.SMTP_PORT) || 465;
-  return nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port,
-    secure: port === 465,          // 465 = SSL, 587 = STARTTLS
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    },
-    tls: { rejectUnauthorized: false },
+// Send email via Brevo REST API (avoids SMTP port blocks on Render)
+function sendEmail({ to, subject, html }) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      sender: { name: "Cardium Boss", email: "a314d5001@smtp-brevo.com" },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+    });
+    const req = require("https").request({
+      hostname: "api.brevo.com",
+      path: "/v3/smtp/email",
+      method: "POST",
+      headers: {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "api-key": process.env.BREVO_API_KEY,
+        "content-length": Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = "";
+      res.on("data", chunk => data += chunk);
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve();
+        else reject(new Error(`Brevo API error ${res.statusCode}: ${data}`));
+      });
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
   });
 }
 
@@ -53,8 +72,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 async function sendVerificationEmail(email, token) {
   const link = `${process.env.APP_URL}/api/verify-email?token=${token}`;
-  await makeTransporter().sendMail({
-    from: `"Cardium Boss" <${process.env.SMTP_USER}>`,
+  await sendEmail({
     to: email,
     subject: "Verify your Cardium Boss account",
     html: `
@@ -76,8 +94,7 @@ async function sendVerificationEmail(email, token) {
 
 async function sendPasswordResetEmail(email, token) {
   const link = `${process.env.APP_URL}/api/reset-password-page?token=${token}`;
-  await makeTransporter().sendMail({
-    from: `"Cardium Boss" <${process.env.SMTP_USER}>`,
+  await sendEmail({
     to: email,
     subject: "Reset your Cardium Boss password",
     html: `
@@ -97,13 +114,13 @@ async function sendPasswordResetEmail(email, token) {
   });
 }
 
-// GET /api/smtp-test  (debug — remove after confirming)
+// GET /api/smtp-test  (debug)
 app.get("/api/smtp-test", async (req, res) => {
   try {
-    await makeTransporter().verify();
-    res.json({ ok: true, host: process.env.SMTP_HOST, user: process.env.SMTP_USER });
+    await sendEmail({ to: "craig.thesen@gmail.com", subject: "Cardium Boss SMTP test", html: "<p>SMTP test OK</p>" });
+    res.json({ ok: true, apiKey: process.env.BREVO_API_KEY ? "set" : "MISSING" });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message, host: process.env.SMTP_HOST, user: process.env.SMTP_USER });
+    res.status(500).json({ ok: false, error: e.message, apiKey: process.env.BREVO_API_KEY ? "set" : "MISSING" });
   }
 });
 
