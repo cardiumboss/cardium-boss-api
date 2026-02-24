@@ -39,7 +39,7 @@ pool.query(`
 function sendEmail({ to, subject, html }) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
-      sender: { name: "Cardium Boss", email: "a314d5001@smtp-brevo.com" },
+      sender: { name: "Cardium Boss", email: process.env.SENDER_EMAIL || "a314d5001@smtp-brevo.com" },
       to: [{ email: to }],
       subject,
       htmlContent: html,
@@ -58,7 +58,7 @@ function sendEmail({ to, subject, html }) {
       let data = "";
       res.on("data", chunk => data += chunk);
       res.on("end", () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) resolve();
+        if (res.statusCode >= 200 && res.statusCode < 300) resolve(JSON.parse(data));
         else reject(new Error(`Brevo API error ${res.statusCode}: ${data}`));
       });
     });
@@ -117,10 +117,10 @@ async function sendPasswordResetEmail(email, token) {
 // GET /api/smtp-test  (debug)
 app.get("/api/smtp-test", async (req, res) => {
   try {
-    await sendEmail({ to: "craig.thesen@gmail.com", subject: "Cardium Boss SMTP test", html: "<p>SMTP test OK</p>" });
-    res.json({ ok: true, apiKey: process.env.BREVO_API_KEY ? "set" : "MISSING" });
+    const brevoResponse = await sendEmail({ to: "craig.thesen@gmail.com", subject: "Cardium Boss SMTP test", html: "<p>SMTP test OK</p>" });
+    res.json({ ok: true, apiKey: process.env.BREVO_API_KEY ? "set" : "MISSING", sender: process.env.SENDER_EMAIL || "a314d5001@smtp-brevo.com", brevoResponse });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message, apiKey: process.env.BREVO_API_KEY ? "set" : "MISSING" });
+    res.status(500).json({ ok: false, error: e.message, apiKey: process.env.BREVO_API_KEY ? "set" : "MISSING", sender: process.env.SENDER_EMAIL || "a314d5001@smtp-brevo.com" });
   }
 });
 
